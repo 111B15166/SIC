@@ -1,0 +1,191 @@
+import os
+
+# 更新的操作碼表，根據圖片中的操作碼
+opcode_to_machine_code = {
+    "ADD": ("3", "18"), "ADDF": ("3", "58"), "ADDR": ("2", "90"), "AND": ("3", "40"),
+    "CLEAR": ("2", "B4"), "COMP": ("3", "28"), "COMPR": ("2", "A0"), "DIV": ("3", "24"),
+    "J": ("3", "3C"), "JEQ": ("3", "30"), "JGT": ("3", "34"), "JLT": ("3", "38"),
+    "JSUB": ("3", "48"), "LDA": ("3", "00"), "LDB": ("3", "68"), "LDCH": ("3", "50"),
+    "LDL": ("3", "08"), "LDT": ("3", "74"), "LDX": ("3", "04"), "MUL": ("3", "20"),
+    "OR": ("3", "44"), "RD": ("3", "D8"), "RSUB": ("3", "4C"), "STA": ("3", "0C"),
+    "STCH": ("3", "54"), "STL": ("3", "14"), "STT": ("3", "84"), "STX": ("3", "10"),
+    "SUB": ("3", "1C"), "TD": ("3", "E0"), "TIX": ("3", "2C"), "TIXR": ("2", "B8"),
+    "WD": ("3", "DC")
+}
+
+def parse_line(line):
+    parts = line.strip().split()
+    label, opcode, operand = "", "", ""
+    if len(parts) == 3:
+        label, opcode, operand = parts
+    elif len(parts) == 2:
+        opcode, operand = parts
+    elif len(parts) == 1:
+        opcode = parts[0]
+    return {"LABEL": label, "OPCODE": opcode, "OPERAND": operand, "LOCCTR": None}
+
+def pass1(input_lines):
+    LOCCTR = 0
+    symbol_table = {}
+    intermediate_file = []
+    end_address = None
+
+    # 處理 START 指令
+    if input_lines[0]['OPCODE'] == 'START':
+        LOCCTR = int(input_lines[0]['OPERAND'], 16)  # 初始 LOC 為 START 的操作數
+        input_lines[0]["LOCCTR"] = LOCCTR
+        intermediate_file.append(input_lines[0])
+        input_lines = input_lines[1:]
+
+    # 處理其他指令
+    for line in input_lines:
+        label = line['LABEL']
+        opcode = line['OPCODE']
+        operand = line['OPERAND']
+        current_loc = LOCCTR
+
+        # 紀錄符號位置
+        if label:
+            if label in symbol_table:
+                print(f"錯誤：重複的符號 {label}")
+            else:
+                symbol_table[label] = current_loc
+        
+        # 處理帶有 "+" 的操作碼（擴展格式）
+        if opcode.startswith('+'):
+            opcode = opcode[1:]  # 去除 "+"，保留操作碼本身
+            LOCCTR += 4  # 擴展格式指令加 4
+        # 處理特殊操作碼（CLEAR、COMPR 和 TIXR，這三個加 2）
+        elif opcode in {"CLEAR", "COMPR", "TIXR"}:
+            LOCCTR += 2  # CLEAR、COMPR 和 TIXR 操作碼加 2
+        else:
+            # 計算下一個位置
+            if opcode in opcode_to_machine_code:
+                LOCCTR += 3  # 正常操作碼長度 3 個字節
+            elif opcode == 'WORD':
+                LOCCTR += 3
+            elif opcode == 'RESW':
+                LOCCTR += 3 * int(operand)
+            elif opcode == 'RESB':
+                LOCCTR += int(operand)
+            elif opcode == 'BYTE':
+                if operand.startswith('C\'') and operand.endswith('\''):
+                    LOCCTR += len(operand) - 3  # 字符串長度
+                elif operand.startswith('X\'') and operand.endswith('\''):
+                    LOCCTR += (len(operand) - 3) // 2  # 十六進制長度
+            elif opcode == 'END':
+                end_address = operand
+                line["LOCCTR"] = current_loc
+                intermediate_file.append(line)
+                break
+        
+        # 儲存當前行資訊
+        line["LOCCTR"] = current_loc
+        intermediate_file.append(line)
+
+    return symbol_table, intermediate_file, end_address
+
+def calculate_nixbpe(opcode, operand, symbol_table, locctr, base):
+    n, i, x, b, p, e = 0, 0, 0, 0, 0, 0
+    address = 0
+
+    if opcode.startswith('+'):
+        e = 1  # 擴展格式指令
+        opcode = opcode[1:]
+
+    if operand.startswith('@'):
+        n = 1  # 間接尋址
+        operand = operand[1:]
+    elif operand.startswith('#'):
+        i = 1  # 立即尋址
+        operand = operand[1:]
+        if operand.isdigit():
+            address = int(operand)  # 直接操作數
+    else:
+        n, i = 1, 1  # 簡單尋址
+
+    if ',X' in operand:
+        x = 1  # 索引位元
+        operand = operand.replace(',X', '')
+
+    if operand in symbol_table:
+        target_address = symbol_table[operand]
+        disp = target_address - (locctr + 3)  # 預設使用 PC 相對位址
+
+        if -2048 <= disp <= 2047:  # PC 相對位址有效
+            p = 1
+            address = disp & 0xFFF
+        elif base is not None and 0 <= target_address - base <= 4095:
+            b = 1  # 使用基底位址
+            address = target_address - base
+        else:
+            print(f"錯誤：無法解析位址 {operand}")
+
+    return n, i, x, b, p, e, address
+
+def pass2(intermediate_file, symbol_table, end_address):
+    formatted_output = []
+    formatted_output.append(f"{'位置':<15}{'原始敘述':<13}{'Object code':<10}")
+
+    base = None  # 初始化基底位址
+
+    for i, line in enumerate(intermediate_file):
+        locctr = line['LOCCTR']
+        label = line['LABEL']
+        opcode = line['OPCODE']
+        operand = line['OPERAND']
+
+        # 處理 BASE 指令，將 LOCCTR 設為空白
+        if opcode == "BASE":
+            base = symbol_table.get(operand, None)
+            locctr = None  # BASE 指令不需要顯示 LOCCTR
+
+        locctr_str = f"{locctr:04X}" if locctr is not None else "        "  # 當 LOCCTR 為 None 時顯示空白
+        
+        obj_code = ""
+
+        # 處理機器碼生成
+        if opcode in opcode_to_machine_code:
+            opcode_format, machine_code = opcode_to_machine_code[opcode]
+            n, i, x, b, p, e, address = calculate_nixbpe(opcode, operand, symbol_table, locctr, base)
+
+            nixbpe_bits = (n << 5) | (i << 4) | (x << 3) | (b << 2) | (p << 1) | e
+            if e == 1:  # 格式 4
+                obj_code = f"{int(machine_code, 16) + (n << 1) + i:02X}{nixbpe_bits:01X}{address:05X}"
+            else:  # 格式 3
+                obj_code = f"{int(machine_code, 16) + (n << 1) + i:02X}{nixbpe_bits:01X}{address:03X}"
+
+                # 確保格式 3 的機器碼只有 6 位數
+                obj_code = obj_code[:6]
+        elif opcode == 'BYTE':
+            obj_code = ''.join(f"{ord(c):02X}" for c in operand[2:-1]) if operand.startswith("C'") else operand[2:-1]
+        elif opcode == 'WORD':
+            value = int(operand)
+            obj_code = f"{(value + (1 << 24)) & 0xFFFFFF:06X}" if value < 0 else f"{value:06X}"
+        
+        formatted_line = f"{locctr_str:<10}{label:<8} {opcode:<6} {operand:<10}{obj_code:<6}"
+        formatted_output.append(formatted_line)
+
+    return formatted_output
+
+def main():
+    input_file = "C:\\Users\\Administrator\\新增資料夾\\SICXE.txt"
+    output_dir = "C:\\Users\\Administrator\\新增資料夾"
+    output_file = os.path.join(output_dir, "SIC_output.txt")
+
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    with open(input_file, "r") as file:
+        input_lines = [parse_line(line) for line in file if line.strip() and not line.startswith('.')]
+
+    symbol_table, intermediate_file, end_address = pass1(input_lines)
+    formatted_output = pass2(intermediate_file, symbol_table, end_address)
+    
+    # 儲存結果
+    with open(output_file, "w", encoding="utf-8") as f:
+        for line in formatted_output:
+            f.write(f"{line}\n")
+
+if __name__ == "__main__":
+    main()
