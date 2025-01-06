@@ -8,7 +8,7 @@ opcode_to_machine_code = {
     "JGT": ("3", "34"), "JLT": ("3", "38"), "JSUB": ("3", "48"), "LDA": ("3", "00"),
     "LDB": ("3", "68"), "LDCH": ("3", "50"), "LDF": ("3", "70"), "LDL": ("3", "08"),
     "LDS": ("3", "6C"), "LDT": ("3", "74"), "LDX": ("3", "04"), "LPS": ("3", "E0"),
-    "MUL": ("3", "20"), "MULF": ("3", "60"), "MULR": ("2", "98"), "NORM": ("1", "C8"),
+    "UML": ("3", "20"), "MULF": ("3", "60"), "MULR": ("2", "98"), "NORM": ("1", "C8"),
     "OR": ("3", "44"), "RD": ("3", "D8"), "RMO": ("2", "AC"), "RSUB": ("3", "4C"),
     "SHIFTL": ("2", "A4"), "SHIFTR": ("2", "A8"), "SIO": ("1", "F0"), "SSK": ("3", "EC"),
     "STA": ("3", "0C"), "STB": ("3", "78"), "STCH": ("3", "54"), "STF": ("3", "80"),
@@ -103,17 +103,19 @@ def pass2(intermediate_file, symbol_table, end_address):
             formatted_output.append(formatted_line)
             continue
 
-        if opcode.startswith('+'):
-            obj_code = generate_format4_code(operand, opcode_to_machine_code[opcode[1:]][1], symbol_table)
-        elif opcode in opcode_to_machine_code:
-            opcode_info = opcode_to_machine_code[opcode]
-            op_format = int(opcode_info[0])
-            obj_code = opcode_info[1]
+        if opcode in opcode_to_machine_code or opcode.startswith('+'):
+            opcode_info = opcode_to_machine_code.get(opcode.lstrip('+'), None)
+            if opcode_info:
+                op_format = int(opcode_info[0])
+                obj_code = opcode_info[1]
 
-            if op_format == 3:
-                obj_code = generate_format3_code(operand, obj_code, locctr, symbol_table, base_address)
-            elif op_format == 2:
-                obj_code = generate_format2_code(operand, obj_code)
+                if opcode.startswith('+'):
+                    obj_code = generate_format4_code(operand, obj_code, symbol_table)
+                elif op_format == 3:
+                    obj_code = generate_format3_code(operand, obj_code, locctr, symbol_table, base_address)
+                elif op_format == 2:
+                    obj_code = generate_format2_code(operand, obj_code)
+
         elif opcode == 'BYTE':
             obj_code = generate_byte_code(operand)
         elif opcode == 'WORD':
@@ -127,61 +129,70 @@ def pass2(intermediate_file, symbol_table, end_address):
     return formatted_output
 
 def generate_format4_code(operand, obj_code, symbol_table):
-    n, i, x, b, p, e = 1, 1, 0, 0, 0, 1
-    if operand.startswith('#'):
-        target = operand[1:]
-        disp = int(target) if target.isdigit() else symbol_table.get(target, 0)
-    else:
+    n, i, x, b, p, e = 1, 1, 0, 0, 0, 1  # Format 4: Extended format with e = 1
+    if operand.startswith('#'):  # Immediate addressing
+        n, i = 0, 1
+        disp = int(operand[1:]) if operand[1:].isdigit() else symbol_table.get(operand[1:], 0)
+    elif operand.startswith('@'):  # Indirect addressing
+        n, i = 1, 0
+        disp = symbol_table.get(operand[1:], 0)
+    else:  # Simple addressing
         disp = symbol_table.get(operand, 0)
 
-    opcode_int = int(obj_code, 16) >> 2
+    opcode_int = int(obj_code, 16) & 0xFC  # Mask lower 2 bits
     nixbpe = (n << 5) | (i << 4) | (x << 3) | (b << 2) | (p << 1) | e
-    return f"{(opcode_int << 2 | (nixbpe >> 4)):02X}{nixbpe & 0x0F:01X}{disp:05X}"
+    return f"{opcode_int | ((nixbpe >> 4) & 0x03):02X}{nixbpe & 0x0F:01X}{disp:05X}"
+
 def generate_format3_code(operand, obj_code, locctr, symbol_table, base_address):
-    n, i, x, b, p, e = 1, 1, 0, 0, 0, 0
-    disp = None
+    n, i, x, b, p, e = 1, 1, 0, 0, 0, 0  # Format 3: PC or Base-relative addressing
+    disp = 0
 
-    if ',X' in operand:
-        operand = operand.replace(',X', '')
-        x = 1
+    if operand.startswith('#'):  # Immediate addressing
+        n, i = 0, 1
+        num = operand[1:]  # 去掉 # 符號
+        
+        try:
+            # 如果是數字，將其轉換為16進制
+            disp = int(num)  # 將數字轉為整數
+            disp = f"{disp:04X}"  # 將整數轉為16進制，4位數
+        except ValueError:
+            disp = symbol_table.get(num, 0)  # 如果是符號，查表
 
-    if operand.startswith('#'):  # Immediate mode
-        target = operand[1:]
-        if target.isdigit():
-            disp = int(target)  # Directly use the immediate value
-            n, i = 0, 1  # Immediate mode flags
-        else:
-            disp = symbol_table.get(target, None)
-            if disp is None:
-                raise ValueError(f"未找到符號 {target} 的地址")
-            n, i = 0, 1
-    elif operand.startswith('@'):  # Indirect mode
-        target = operand[1:]
-        disp = symbol_table.get(target, None)
+    elif operand.startswith('@'):  # Indirect addressing
         n, i = 1, 0
-    else:  # Simple addressing mode
-        disp = symbol_table.get(operand, None)
+        disp = symbol_table.get(operand[1:], 0)
+    else:  # Simple addressing
+        disp = symbol_table.get(operand, 0)
 
-    # For immediate mode with a numeric target, skip PC-relative or base-relative addressing
-    if disp is not None and not (operand.startswith('#') and operand[1:].isdigit()):
-        relative_disp = disp - (locctr + 3)
-        if -2048 <= relative_disp <= 2047:
-            disp = relative_disp & 0xFFF
-            p = 1
-        elif base_address is not None and 0 <= disp - base_address <= 4095:
-            disp = disp - base_address
-            b, p = 1, 0
-    elif disp is None:
+    # 確保 disp 是整數格式，如果是16進制字符串，先轉換為整數
+    if isinstance(disp, str):
+        try:
+            disp = int(disp, 16)  # 嘗試將 disp 轉換為 16 進制數字
+        except ValueError:
+            disp = 0  # 如果轉換失敗，設為0
+
+    # PC-relative or Base-relative calculation
+    if disp is not None:
+        relative_disp = disp - (locctr + 3)  # 現在 disp 是整數類型
+        if -2048 <= relative_disp <= 2047:  # PC-relative
+            p, disp = 1, relative_disp & 0xFFF
+        elif base_address is not None and 0 <= disp - base_address <= 4095:  # Base-relative
+            b, p, disp = 1, 0, disp - base_address
+        else:
+            disp = disp & 0xFFF  # Absolute addressing (fallback)
+    else:
         disp = 0
 
-    opcode_int = int(obj_code, 16)
+    # 生成最終的目標碼
+    opcode_int = int(obj_code, 16) & 0xFC  # Mask lower 2 bits
     nixbpe = (n << 5) | (i << 4) | (x << 3) | (b << 2) | (p << 1) | e
     return f"{opcode_int | ((nixbpe >> 4) & 0x03):02X}{nixbpe & 0x0F:01X}{disp:03X}"
 
 def generate_format2_code(operand, obj_code):
-    r1, r2 = operand.split(',') if ',' in operand else (operand, "0")
-    reg1_value = get_register_value(r1)
-    reg2_value = get_register_value(r2)
+    registers = {"A": 0, "X": 1, "L": 2, "B": 3, "S": 4, "T": 5, "F": 6, "PC": 8, "SW": 9}
+    r1, r2 = (operand.split(',') + ["0"])[:2]  # Ensure two operands
+    reg1_value = registers.get(r1, 0)
+    reg2_value = registers.get(r2, 0)
     return f"{obj_code}{reg1_value:01X}{reg2_value:01X}"
 
 def generate_byte_code(operand):
@@ -193,29 +204,31 @@ def generate_byte_code(operand):
         return ""
 
 def generate_word_code(operand):
-    if operand.startswith('-'):
-        value = int(operand)
-        return f"{(0x1000000 + value):06X}"
-    else:
-        return f"{int(operand):06X}"
+    value = int(operand) if operand.lstrip('-').isdigit() else 0
+    return f"{value & 0xFFFFFF:06X}"
 
-def get_register_value(reg):
-    registers = {"A": 0, "X": 1, "L": 2, "B": 3, "S": 4, "T": 5, "F": 6, "PC": 8, "SW": 9}
-    return registers.get(reg, 0)
+def get_target_address(operand, symbol_table):
+    if operand.startswith('#'):
+        return int(operand[1:]) if operand[1:].isdigit() else symbol_table.get(operand[1:], None)
+    elif operand.startswith('@'):
+        return symbol_table.get(operand[1:], None)
+    else:
+        return symbol_table.get(operand, None)
+
 
 def main():
-    input_file = r"C:\Users\CJCU-CC\Desktop\123\SICXE.txt"
-    output_file = r"C:\Users\CJCU-CC\Desktop\123\outputSIC.txt"
+    input_file = "C:\\Users\\Administrator\\新增資料夾\\SICXE.txt"
+    output_file = "C:\\Users\\Administrator\\新增資料夾\\SIC_output.txt"
 
-    with open(input_file, "r") as file:
-        input_lines = [parse_line(line) for line in file if line.strip() and not line.startswith('.')]
+    with open(input_file, "r") as f:
+        input_lines = [parse_line(line) for line in f if line.strip()]
 
     symbol_table, intermediate_file, end_address = pass1(input_lines)
-    formatted_output = pass2(intermediate_file, symbol_table, end_address)
+    output = pass2(intermediate_file, symbol_table, end_address)
 
     with open(output_file, "w") as f:
-        for line in formatted_output:
-            f.write(f"{line}\n")
+        for line in output:
+            f.write(line + "\n")
 
 if __name__ == "__main__":
-    main()    
+    main()
